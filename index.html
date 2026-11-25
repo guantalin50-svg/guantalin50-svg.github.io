@@ -44,7 +44,14 @@ canvas{display:block;width:100%;height:100%;image-rendering:pixelated;border-rad
 .event-meta{display:flex;align-items:center;gap:10px;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
 .event-meta strong{color:var(--accent);font-weight:600}
 .event-text,.empty{font-size:13px;line-height:1.5;margin:3px 0 0}
-#selection{font-size:13px;color:var(--ink);padding:10px 12px;border-left:2px solid var(--accent);margin:12px 0 0;background:var(--panel)}
+#selection{overflow-wrap:anywhere;font-size:13px;color:var(--ink);padding:10px 12px;border-left:2px solid var(--accent);margin:12px 0 0;background:var(--panel)}
+
+#selection h2{font-size:16px;margin:0 0 6px}
+#order-form{display:grid;gap:8px}
+#order-form textarea,#order-form button{font:inherit;font-size:16px;color:var(--ink);background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:10px}
+#order-form textarea{width:100%;resize:vertical}
+#order-form button{min-height:44px;cursor:pointer;color:var(--accent)}
+#order-help{color:var(--muted);margin:0}
 body.night{--bg:#1a1823;--panel:#25212d;--border:#514154}
 @media(max-width:900px){.layout{grid-template-columns:minmax(0,1fr)}#feed{max-height:360px}}
 @media(max-width:520px){.bubble.ambient{display:none}.person{height:24px;min-width:28px}.nametag{padding:0 2px}}
@@ -97,7 +104,18 @@ body.night{--bg:#1a1823;--panel:#25212d;--border:#514154}
       <div class="targets" id="targets"></div>
     </div></div>
     <nav class="crew" id="crew" aria-label="七位店員"></nav>
-    <p id="selection" hidden></p>
+    <section id="selection" aria-labelledby="staff-name" hidden>
+      <h2 id="staff-name"></h2>
+      <p id="staff-activity"></p>
+      <p id="staff-order" role="status"></p>
+      <form id="order-form">
+        <label for="order-text">交代工作</label>
+        <textarea id="order-text" maxlength="400" rows="3" required aria-describedby="order-help"></textarea>
+        <button type="submit" id="order-send">送出交代</button>
+        <p id="order-help">會打開 GitHub，請用您的帳號按 Submit new issue 送出。只要登入過一次即可。</p>
+        <p id="order-message" role="status" hidden></p>
+      </form>
+    </section>
   </section>
   <aside class="panel" aria-labelledby="feed-title">
     <div class="panel-head"><h2 id="feed-title">即時動態</h2><span class="snapshot" id="snapshot"></span></div>
@@ -278,12 +296,29 @@ function focus(){
     c.button.setAttribute("aria-pressed",String(pinned===c.id));
     c.legend.setAttribute("aria-pressed",String(pinned===c.id));
   }
-  const person=crew.find(c=>c.id===selected && c.data);
+  renderStaff();
+}
+const pendingOrders = new Map();
+const orderDrafts = new Map();
+function renderStaff(){
+  const person=crew.find(c=>c.id===pinned && c.data);
   $("selection").hidden=!person;
-  if(person) $("selection").textContent=person.name+" · "+person.data.activity+"｜"+person.data.thought;
+  if(!person)return;
+  const {name,role,activity,thought,order}=person.data;
+  $("staff-name").textContent=name+" · "+role;
+  $("staff-activity").textContent=activity+"｜"+thought;
+  const pending=pendingOrders.get(person.id);
+  const waiting=pending && (!order || Date.parse(order.at)!==Date.parse(pending));
+  if(pending && !waiting)pendingOrders.delete(person.id);
+  const time=order && Number.isFinite(Date.parse(order.at)) ? "（台北 "+timeOnly.format(new Date(order.at))+"）" : "";
+  const last=order ? "最近交代"+time+" · 已收到："+order.text : "尚無收到的交代";
+  $("staff-order").textContent=waiting ? "新交代 · 尚在等候｜"+last : last;
 }
 function toggle(id){
+  if(pinned)orderDrafts.set(pinned,$("order-text").value);
   pinned=pinned===id ? null : id;
+  $("order-text").value=orderDrafts.get(pinned)||"";
+  $("order-message").hidden=true;
   focus();
   for(const li of $("feed").children)li.classList.toggle("mark",li.dataset.id===pinned);
 }
@@ -382,6 +417,50 @@ async function decryptStatus(bundle, password){
   return JSON.parse(dec.decode(pt));
 }
 let cafePassword=null;
+async function encryptOrder(order,password){
+  const salt=crypto.getRandomValues(new Uint8Array(16));
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const enc=new TextEncoder();
+  const material=await crypto.subtle.importKey("raw",enc.encode(password),"PBKDF2",false,["deriveKey"]);
+  const iter=210000, hash="SHA-256";
+  const key=await crypto.subtle.deriveKey(
+    {name:"PBKDF2",salt,iterations:iter,hash},material,{name:"AES-GCM",length:256},false,["encrypt"]
+  );
+  const ct=await crypto.subtle.encrypt({name:"AES-GCM",iv},key,enc.encode(JSON.stringify(order)));
+  const toB64=bytes=>btoa(String.fromCharCode(...new Uint8Array(bytes)));
+  return {v:1,kdf:"PBKDF2",hash,iter,salt:toB64(salt),iv:toB64(iv),ct:toB64(ct)};
+}
+$("order-form").addEventListener("submit",async event=>{
+  event.preventDefault();
+  const message=$("order-message");
+  message.hidden=false;
+  if(!cafePassword){message.textContent="請先用咖啡廳密碼登入。";return;}
+  const person=crew.find(c=>c.id===pinned && c.data);
+  const text=$("order-text").value.trim();
+  if(!person || !text || text.length>400){message.textContent="請輸入 1 至 400 字的交代。";return;}
+  // Open during the tap so mobile browsers allow the new tab.
+  const tab=window.open("about:blank","_blank");
+  if(!tab){message.textContent="請允許開啟新分頁，再送出交代。";return;}
+  tab.opener=null;
+  $("order-send").disabled=true;
+  message.textContent="正在加密交代…";
+  try{
+    const at=new Date(Date.now()+8*60*60*1000).toISOString().replace("Z","+08:00");
+    const bundle=await encryptOrder({agent:person.id,name:person.name,text,at},cafePassword);
+    const title=encodeURIComponent("cafe-order-"+person.id);
+    const body=encodeURIComponent(JSON.stringify(bundle));
+    if(tab.closed)throw new Error("tab closed");
+    tab.location.replace("https://github.com/guantalin50-svg/guantalin50-svg.github.io/issues/new?title="+title+"&body="+body);
+    pendingOrders.set(person.id,at);
+    if(pinned===person.id)message.textContent="請到 GitHub 按 Submit new issue 送出。";
+    renderStaff();
+  } catch {
+    tab.close();
+    if(pinned===person.id)message.textContent="無法開啟交代，請再試一次。";
+  } finally {
+    $("order-send").disabled=false;
+  }
+});
 async function poll(){
   if(!cafePassword)return;
   const controller=new AbortController();
